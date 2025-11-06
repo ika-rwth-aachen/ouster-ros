@@ -179,7 +179,8 @@ class ImageProcessor {
                                      PostProcessingFn func) {
         auto handler = std::make_shared<ImageProcessor>(info, frame, mask_path, func);
         return [handler](const ouster::LidarScan& lidar_scan, uint64_t scan_ts,
-                         const rclcpp::Time& msg_ts) {
+                         const rclcpp::Time& msg_ts,
+                         const rclcpp::Time&) {
             handler->process(lidar_scan, scan_ts, msg_ts);
         };
     }

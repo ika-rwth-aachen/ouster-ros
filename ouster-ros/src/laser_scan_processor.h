@@ -64,7 +64,8 @@ class LaserScanProcessor {
             std::make_shared<LaserScanProcessor>(info, frame, ring, func);
 
         return [handler](const ouster::LidarScan& lidar_scan, uint64_t scan_ts,
-                         const rclcpp::Time& msg_ts) {
+                         const rclcpp::Time& msg_ts,
+                         const rclcpp::Time&) {
             handler->process(lidar_scan, scan_ts, msg_ts);
         };
     }

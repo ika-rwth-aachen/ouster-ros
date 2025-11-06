@@ -54,7 +54,8 @@ namespace ouster_ros {
 namespace sensor = ouster::sensor;
 
 using LidarScanProcessor =
-    std::function<void(const ouster::LidarScan&, uint64_t, const rclcpp::Time&)>;
+    std::function<void(const ouster::LidarScan&, uint64_t,
+                       const rclcpp::Time&, const rclcpp::Time&)>;
 
 class LidarPacketHandler {
     using LidarPacketAccumlator =
@@ -133,6 +134,7 @@ class LidarPacketHandler {
                     auto& lidar_scan = *lidar_scans[ring_buffer.write_head()];
                     result = lidar_handler(*this, pf, lidar_packet, lidar_scan);
                     if (result) {
+                        lidar_scan_udp_receive_time_ = ros_clock_.now();
                         // count the number of valid columns in the scan
                         auto status = lidar_scan.status();
                         size_t valid_cols = std::count_if(status.data(), status.data() + status.size(),
@@ -202,7 +204,7 @@ class LidarPacketHandler {
 
         for (auto h : lidar_scan_handlers) {
             h(*lidar_scans[ring_buffer.read_head()], lidar_scan_estimated_ts,
-              lidar_scan_estimated_msg_ts);
+              lidar_scan_estimated_msg_ts, lidar_scan_udp_receive_time_);
         }
 
         // when we hit percent amount of the ring_buffer capacity throttle
@@ -364,6 +366,7 @@ class LidarPacketHandler {
 
     uint64_t lidar_scan_estimated_ts;
     rclcpp::Time lidar_scan_estimated_msg_ts;
+    rclcpp::Time lidar_scan_udp_receive_time_;
 
     std::optional<rclcpp::Time> lidar_handler_ros_time_frame_ts;
 
@@ -387,6 +390,8 @@ class LidarPacketHandler {
     int64_t ptp_utc_tai_offset_;
 
     float min_scan_valid_columns_ratio_ = 0.0f;
+
+    rclcpp::Clock ros_clock_{RCL_ROS_TIME};
 };
 
 }  // namespace ouster_ros

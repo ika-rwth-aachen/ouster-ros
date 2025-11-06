@@ -23,7 +23,8 @@ namespace ouster_ros {
 // Moved out of PointCloudProcessor to avoid type templatization
 using PointCloudProcessor_OutputType =
     std::vector<std::shared_ptr<sensor_msgs::msg::PointCloud2>>;
-using PointCloudProcessor_PostProcessingFn = std::function<void(PointCloudProcessor_OutputType)>;
+using PointCloudProcessor_PostProcessingFn =
+    std::function<void(PointCloudProcessor_OutputType, const rclcpp::Time&)>;
 
 
 template <class PointT>
@@ -84,7 +85,8 @@ class PointCloudProcessor {
     }
 
     void process(const ouster::LidarScan& lidar_scan, uint64_t scan_ts,
-                 const rclcpp::Time& msg_ts) {
+                 const rclcpp::Time& msg_ts,
+                 const rclcpp::Time& udp_receive_time) {
         for (int i = 0; i < static_cast<int>(pc_msgs.size()); ++i) {
             auto range_channel = static_cast<sensor::ChanField>(sensor::ChanField::RANGE + i);
             auto range = lidar_scan.field<uint32_t>(range_channel);
@@ -101,7 +103,7 @@ class PointCloudProcessor {
             pc_msgs[i]->header.frame_id = frame;
         }
 
-        if (post_processing_fn) post_processing_fn(pc_msgs);
+        if (post_processing_fn) post_processing_fn(pc_msgs, udp_receive_time);
     }
 
    public:
@@ -118,8 +120,9 @@ class PointCloudProcessor {
             scan_to_cloud_fn_, post_processing_fn);
 
         return [handler](const ouster::LidarScan& lidar_scan, uint64_t scan_ts,
-                         const rclcpp::Time& msg_ts) {
-            handler->process(lidar_scan, scan_ts, msg_ts);
+                         const rclcpp::Time& msg_ts,
+                         const rclcpp::Time& udp_receive_time) {
+            handler->process(lidar_scan, scan_ts, msg_ts, udp_receive_time);
         };
     }
 

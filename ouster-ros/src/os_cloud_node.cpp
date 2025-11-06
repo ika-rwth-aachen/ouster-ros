@@ -129,9 +129,12 @@ class OusterCloud : public OusterProcessingNodeBase {
 
         if (impl::check_token(tokens, "PCL")) {
             lidar_pubs.resize(num_returns);
+            lidar_topic_names.assign(num_returns, "");
             for (int i = 0; i < num_returns; ++i) {
+                auto topic_name = topic_for_return("points", i);
+                lidar_topic_names[i] = topic_name;
                 lidar_pubs[i] = create_publisher<sensor_msgs::msg::PointCloud2>(
-                    topic_for_return("points", i), selected_qos);
+                    topic_name, selected_qos);
             }
 
             auto point_type = get_parameter("point_type").as_string();
@@ -166,9 +169,31 @@ class OusterCloud : public OusterProcessingNodeBase {
                     info, tf_bcast.point_cloud_frame_id(),
                     tf_bcast.apply_lidar_to_sensor_transform(),
                     organized, destagger, min_range, max_range, v_reduction, mask_path,
-                    [this](PointCloudProcessor_OutputType msgs) {
-                        for (size_t i = 0; i < msgs.size(); ++i)
+                    [this](PointCloudProcessor_OutputType msgs,
+                           const rclcpp::Time& udp_receive_time) {
+                        for (size_t i = 0; i < msgs.size(); ++i) {
+                            const auto before_publish = this->now();
                             lidar_pubs[i]->publish(*msgs[i]);
+                            const auto after_publish = this->now();
+                            const auto msg_stamp =
+                                rclcpp::Time(msgs[i]->header.stamp, RCL_ROS_TIME);
+                            const double udp_vs_stamp_ms =
+                                (udp_receive_time - msg_stamp).seconds() * 1e3;
+                            const double prepub_vs_stamp_ms =
+                                (before_publish - msg_stamp).seconds() * 1e3;
+                            const double publish_duration_ms =
+                                (after_publish - before_publish).seconds() * 1e3;
+                            const std::string topic_name =
+                                (lidar_topic_names.size() > i && !lidar_topic_names[i].empty())
+                                    ? lidar_topic_names[i]
+                                    : lidar_pubs[i]->get_topic_name();
+                            RCLCPP_INFO(
+                                this->get_logger(),
+                                "PointCloud timing [%s]: udp_to_stamp=%.3f ms, "
+                                "prepub_to_stamp=%.3f ms, publish_duration=%.3f ms",
+                                topic_name.c_str(), udp_vs_stamp_ms, prepub_vs_stamp_ms,
+                                publish_duration_ms);
+                        }
                     }
                 )
             );
@@ -255,6 +280,7 @@ class OusterCloud : public OusterProcessingNodeBase {
     rclcpp::Subscription<PacketMsg>::SharedPtr lidar_packet_sub;
     std::vector<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr>
         lidar_pubs;
+    std::vector<std::string> lidar_topic_names;
     std::vector<rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr>
         scan_pubs;
 
