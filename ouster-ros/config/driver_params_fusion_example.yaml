@@ -1,0 +1,44 @@
+ouster/os_driver:
+  ros__parameters:
+    sensor_profiles: [front_sensor, rear_sensor]
+    fusion_target_frame: base_link
+    fusion_publish_rate: 20.0
+    fusion_tf_timeout: 0.1
+    point_type: original
+    organized: true
+    destagger: true
+    min_range: 0.0
+    max_range: 1000.0
+    v_reduction: 1
+    proc_mask: PCL
+    use_system_default_qos: true
+
+    front_sensor.sensor_hostname: '192.168.0.61'
+    front_sensor.udp_dest: ''
+    front_sensor.mtp_dest: ''
+    front_sensor.mtp_main: false
+    front_sensor.lidar_port: 7502
+    front_sensor.imu_port: 7503
+    front_sensor.lidar_mode: '1024x10'
+    front_sensor.timestamp_mode: 'TIME_FROM_PTP_1588'
+    front_sensor.ptp_utc_tai_offset: -37.0
+    front_sensor.udp_profile_lidar: ''
+    front_sensor.azimuth_window_start: 90000
+    front_sensor.azimuth_window_end: 270000
+    front_sensor.point_cloud_frame: drivers/ouster_lidar_fl/lidar
+    front_sensor.metadata: ''
+
+    rear_sensor.sensor_hostname: '192.168.0.62'
+    rear_sensor.udp_dest: ''
+    rear_sensor.mtp_dest: ''
+    rear_sensor.mtp_main: false
+    rear_sensor.lidar_port: 7504
+    rear_sensor.imu_port: 7505
+    rear_sensor.lidar_mode: '1024x10'
+    rear_sensor.timestamp_mode: 'TIME_FROM_PTP_1588'
+    rear_sensor.ptp_utc_tai_offset: -37.0
+    rear_sensor.udp_profile_lidar: ''
+    rear_sensor.azimuth_window_start: 90000
+    rear_sensor.azimuth_window_end: 270000
+    rear_sensor.point_cloud_frame: drivers/ouster_lidar_fr/lidar
+    rear_sensor.metadata: ''
