@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -1002,6 +1003,15 @@ bool OusterDriver::process_sensor_output(
 void OusterDriver::fusion_timer_callback() {
     if (sensor_contexts_.empty()) return;
 
+    using clock = std::chrono::steady_clock;
+    auto callback_start = clock::now();
+    struct SensorTiming {
+        std::string name;
+        double ms;
+        size_t clouds;
+    };
+    std::vector<SensorTiming> sensor_timings;
+
     std::vector<std::vector<sensor_msgs::msg::PointCloud2>> per_return;
     per_return.resize(fusion_pubs_.size());
 
@@ -1009,6 +1019,7 @@ void OusterDriver::fusion_timer_callback() {
     rclcpp::Time fused_stamp = get_clock()->now();
 
     for (const auto& ctx : sensor_contexts_) {
+        auto sensor_start = clock::now();
         ouster::LidarScan scan(ctx->info.format.columns_per_frame,
                                ctx->info.format.pixels_per_column,
                                ctx->info.format.udp_profile_lidar);
@@ -1024,15 +1035,53 @@ void OusterDriver::fusion_timer_callback() {
              ++i) {
             per_return[i].push_back(transformed[i]);
         }
+        auto sensor_end = clock::now();
+        double sensor_ms =
+            std::chrono::duration<double, std::milli>(sensor_end - sensor_start)
+                .count();
+        sensor_timings.push_back(
+            SensorTiming{ctx->profile.name, sensor_ms, transformed.size()});
     }
 
     if (!have_data) return;
 
+    std::vector<double> build_timings(fusion_pubs_.size(), 0.0);
+    std::vector<size_t> build_cloud_counts(fusion_pubs_.size(), 0);
+    double publish_ms_total = 0.0;
+
     for (size_t i = 0; i < fusion_pubs_.size(); ++i) {
+        auto build_start = clock::now();
         auto fused_msg =
             fuse_transformed_clouds(per_return[i], fusion_frame_, fused_stamp);
+        build_timings[i] =
+            std::chrono::duration<double, std::milli>(clock::now() - build_start)
+                .count();
+        build_cloud_counts[i] = per_return[i].size();
+        auto publish_start = clock::now();
         fusion_pubs_[i]->publish(fused_msg);
+        publish_ms_total +=
+            std::chrono::duration<double, std::milli>(clock::now() - publish_start)
+                .count();
     }
+
+    auto total_ms =
+        std::chrono::duration<double, std::milli>(clock::now() - callback_start)
+            .count();
+
+    for (const auto& timing : sensor_timings) {
+        RCLCPP_DEBUG(get_logger(),
+                     "[fusion] sensor '%s' processed %zu returns in %.3f ms",
+                     timing.name.c_str(), timing.clouds, timing.ms);
+    }
+    for (size_t i = 0; i < build_timings.size(); ++i) {
+        RCLCPP_DEBUG(get_logger(),
+                     "[fusion] fused return %zu from %zu clouds in %.3f ms",
+                     i, build_cloud_counts[i], build_timings[i]);
+    }
+    RCLCPP_DEBUG(get_logger(),
+                 "[fusion] published %zu returns in %.3f ms "
+                 "(publish %.3f ms total)",
+                 fusion_pubs_.size(), total_ms, publish_ms_total);
 }
 
 }  // namespace ouster_ros
