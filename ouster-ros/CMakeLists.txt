@@ -21,6 +21,8 @@ find_package(Eigen3 REQUIRED)
 find_package(PCL REQUIRED COMPONENTS common)
 find_package(pcl_conversions REQUIRED)
 find_package(tf2_eigen REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_sensor_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(point_cloud_transport REQUIRED)
 
@@ -170,7 +172,7 @@ rclcpp_components_register_node(os_image_component
 # ==== os_driver_component ====
 create_ros2_component(os_driver_component
   "src/os_sensor_node_base.cpp;src/os_sensor_node.cpp;src/os_driver_node.cpp"
-  "std_srvs"
+  "std_srvs;tf2_ros;tf2_sensor_msgs"
 )
 rclcpp_components_register_node(os_driver_component
   PLUGIN "ouster_ros::OusterDriver"

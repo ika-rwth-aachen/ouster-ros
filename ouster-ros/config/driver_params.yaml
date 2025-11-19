@@ -3,6 +3,17 @@ ouster/os_driver:
     # sensor_hostname[required]: hostname or IP address of the sensor (IP4 or
     # IP6).
     sensor_hostname: ''
+    # sensor_profiles[optional]: list of profile names for multi-sensor fusion.
+    # When set, each profile must define parameters using the "<name>.param"
+    # convention (e.g. front.sensor_hostname). Leave empty to run the driver in
+    # single sensor mode.
+    sensor_profiles: []
+    # fusion_target_frame[optional]: TF frame for the fused pointcloud output.
+    fusion_target_frame: os_fusion
+    # fusion_publish_rate[optional]: rate in Hz for publishing the fused cloud.
+    fusion_publish_rate: 20.0
+    # fusion_tf_timeout[optional]: TF lookup timeout for per-sensor transforms.
+    fusion_tf_timeout: 0.1
     # udp_dest[optional]: hostname or multicast group IP where the sensor will
     # send UDP data packets.
     udp_dest: ''
