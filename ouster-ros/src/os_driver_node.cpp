@@ -311,6 +311,7 @@ class OusterDriver : public OusterSensor {
 
     virtual LifecycleNodeInterface::CallbackReturn on_configure(
         const rclcpp_lifecycle::State& state) override {
+        LifecycleNode::on_configure(state);
         sensor_profile_names_ =
             get_parameter("sensor_profiles").as_string_array();
         fusion_mode_enabled_ = !sensor_profile_names_.empty();
@@ -336,12 +337,16 @@ class OusterDriver : public OusterSensor {
         if (!fusion_mode_enabled_) {
             return OusterSensor::on_activate(state);
         }
+        LifecycleNode::on_activate(state);
 
         if (!fusion_timer_) {
             double rate = fusion_publish_rate_ > 0.0 ? fusion_publish_rate_ : 1.0;
             auto period = std::chrono::duration<double>(1.0 / rate);
             fusion_timer_ = create_wall_timer(
                 period, std::bind(&OusterDriver::fusion_timer_callback, this));
+            RCLCPP_INFO(get_logger(),
+                        "Fusion timer started at %.2f Hz targeting frame '%s'",
+                        rate, fusion_frame_.c_str());
         }
 
         return LifecycleNodeInterface::CallbackReturn::SUCCESS;
@@ -352,6 +357,7 @@ class OusterDriver : public OusterSensor {
         if (!fusion_mode_enabled_) {
             return OusterSensor::on_deactivate(state);
         }
+        LifecycleNode::on_deactivate(state);
         if (fusion_timer_) {
             fusion_timer_->cancel();
             fusion_timer_.reset();
@@ -364,6 +370,7 @@ class OusterDriver : public OusterSensor {
         if (!fusion_mode_enabled_) {
             return OusterSensor::on_cleanup(state);
         }
+        LifecycleNode::on_cleanup(state);
         if (fusion_timer_) {
             fusion_timer_->cancel();
             fusion_timer_.reset();
@@ -804,6 +811,10 @@ bool OusterDriver::start_sensor_context(
         if (is_arg_set(ctx->profile.metadata_path)) {
             write_text_to_file(ctx->profile.metadata_path, metadata);
         }
+        RCLCPP_INFO(get_logger(),
+                    "Profile '%s' connected (sn: %s, mode: %s)",
+                    ctx->profile.name.c_str(), ctx->info.sn.c_str(),
+                    sensor::to_string(ctx->info.mode).c_str());
 
         ctx->accumulator = std::make_unique<StreamingLidarAccumulator>(
             ctx->info, ctx->profile.timestamp_mode,
@@ -861,6 +872,8 @@ bool OusterDriver::start_sensor_context(
                     }
                 }
             }
+            RCLCPP_INFO(get_logger(), "Profile '%s' packet thread exited",
+                        ctx->profile.name.c_str());
         });
     } catch (const std::exception& ex) {
         RCLCPP_ERROR(get_logger(),
@@ -917,6 +930,8 @@ bool OusterDriver::initialize_fusion_mode() {
             sensor_contexts_.clear();
             return false;
         }
+        RCLCPP_INFO(get_logger(), "Profile '%s' streaming thread started",
+                    profile_name.c_str());
         sensor_contexts_.push_back(ctx);
     }
 
@@ -1025,7 +1040,12 @@ void OusterDriver::fusion_timer_callback() {
                                ctx->info.format.udp_profile_lidar);
         uint64_t scan_ts = 0;
         rclcpp::Time msg_ts;
-        if (!ctx->accumulator->snapshot(scan, scan_ts, msg_ts)) continue;
+        if (!ctx->accumulator->snapshot(scan, scan_ts, msg_ts)) {
+            RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 2000,
+                                  "Profile '%s' has no complete scan yet",
+                                  ctx->profile.name.c_str());
+            continue;
+        }
         have_data = true;
         if (msg_ts < fused_stamp) fused_stamp = msg_ts;
         std::vector<sensor_msgs::msg::PointCloud2> transformed;
@@ -1043,7 +1063,11 @@ void OusterDriver::fusion_timer_callback() {
             SensorTiming{ctx->profile.name, sensor_ms, transformed.size()});
     }
 
-    if (!have_data) return;
+    if (!have_data) {
+        RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 2000,
+                              "Fusion timer waiting for sensor data");
+        return;
+    }
 
     std::vector<double> build_timings(fusion_pubs_.size(), 0.0);
     std::vector<size_t> build_cloud_counts(fusion_pubs_.size(), 0);
