@@ -767,6 +767,23 @@ bool OusterDriver::initialize_fusion_mode() {
     return true;
 }
 
+void OusterDriver::stop_sensor_contexts() {
+    for (auto& ctx : sensor_contexts_) {
+        if (ctx->running) ctx->running = false;
+        if (ctx->packet_thread && ctx->packet_thread->joinable()) {
+            ctx->packet_thread->join();
+        }
+        ctx->packet_thread.reset();
+        ctx->client.reset();
+        ctx->lidar_packet_handler = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(ctx->clouds_mutex);
+            ctx->processed_clouds.clear();
+            ctx->cloud_ready = false;
+        }
+    }
+}
+
 bool OusterDriver::transform_cloud(const sensor_msgs::msg::PointCloud2& in,
                                    sensor_msgs::msg::PointCloud2& out,
                                    const std::string& frame,
