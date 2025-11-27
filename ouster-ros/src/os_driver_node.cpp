@@ -35,6 +35,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <mutex>
 #include <optional>
 #include <vector>
@@ -46,6 +47,36 @@ namespace sensor = ouster::sensor;
 using ouster::sensor::LidarPacket;
 using ouster::sensor::ImuPacket;
 using ouster::sensor::LidarPacket;
+
+namespace {
+
+bool is_ros_time_mode(const std::string& mode) {
+    return mode == "TIME_FROM_ROS_TIME" || mode == "TIME_FROM_ROS_RECEPTION";
+}
+
+double compute_scan_col_ts_spacing_ns(sensor::lidar_mode ld_mode) {
+    const auto scan_width = sensor::n_cols_of_lidar_mode(ld_mode);
+    const auto scan_frequency = sensor::frequency_of_lidar_mode(ld_mode);
+    constexpr double kOneSecondInNs = 1e9;
+    return scan_width > 0 && scan_frequency > 0
+               ? kOneSecondInNs / (scan_width * scan_frequency)
+               : 0.0;
+}
+
+uint16_t packet_col_index(const sensor::packet_format& pf,
+                          const uint8_t* lidar_buf) {
+    return pf.col_measurement_id(pf.nth_col(0, lidar_buf));
+}
+
+uint64_t first_nonzero_timestamp(
+    const ouster::LidarScan::Header<uint64_t>& ts_header) {
+    auto it =
+        std::find_if(ts_header.data(), ts_header.data() + ts_header.size(),
+                     [](uint64_t ts) { return ts != 0; });
+    return it == ts_header.data() + ts_header.size() ? 0 : *it;
+}
+
+}  // namespace
 
 struct SensorProfileConfig {
     std::string name;
@@ -70,14 +101,25 @@ struct SensorContext {
     sensor::sensor_config config;
     std::shared_ptr<sensor::client> client;
     sensor::sensor_info info;
-    LidarPacketHandler::HandlerType lidar_packet_handler;
+    LidarScanProcessor lidar_scan_processor;
+    std::unique_ptr<ouster::ScanBatcher> scan_batcher;
+    std::unique_ptr<ouster::LidarScan> active_scan;
+    const sensor::packet_format* packet_format{nullptr};
     sensor::LidarPacket lidar_packet;
     std::unique_ptr<std::thread> packet_thread;
     std::atomic<bool> running{false};
+    std::mutex scan_mutex;
+    uint64_t active_scan_ts{0};
+    rclcpp::Time active_scan_stamp;
+    bool stamp_ready{false};
+    bool expect_frame_start{true};
+    double scan_col_ts_spacing_ns{0.0};
+    int64_t ptp_utc_tai_offset_ns{0};
+    double min_scan_valid_columns_ratio{0.0};
+    std::atomic<bool> scan_dirty{false};
     std::mutex clouds_mutex;
     std::vector<sensor_msgs::msg::PointCloud2> processed_clouds;
     rclcpp::Time last_cloud_stamp;
-    bool cloud_ready{false};
 };
 
 class OusterDriver : public OusterSensor {
@@ -448,6 +490,17 @@ std::vector<std::shared_ptr<SensorContext>> sensor_contexts_;
     void fusion_timer_callback();
     bool ensure_fusion_publishers(size_t num_returns,
                                   rclcpp::QoS qos_profile);
+    void handle_streaming_packet(const std::shared_ptr<SensorContext>& ctx,
+                                 const sensor::LidarPacket& packet);
+    void update_scan_timestamps_locked(
+        const std::shared_ptr<SensorContext>& ctx,
+        const rclcpp::Time& packet_receive_time, int packet_first_col);
+    bool snapshot_active_scan(const std::shared_ptr<SensorContext>& ctx,
+                              ouster::LidarScan& scan_copy,
+                              uint64_t& scan_ts, rclcpp::Time& msg_ts);
+    rcl_clock_type_t node_clock_type() const {
+        return get_clock()->get_clock_type();
+    }
     bool collect_transformed_clouds(
         const std::shared_ptr<SensorContext>& ctx,
         std::vector<sensor_msgs::msg::PointCloud2>& transformed,
@@ -505,6 +558,9 @@ SensorProfileConfig OusterDriver::load_profile_config(
     cfg.imu_port = get_parameter(prefix + "imu_port").as_int();
     cfg.lidar_mode = get_parameter(prefix + "lidar_mode").as_string();
     cfg.timestamp_mode = get_parameter(prefix + "timestamp_mode").as_string();
+    if (!is_arg_set(cfg.timestamp_mode)) {
+        cfg.timestamp_mode = get_parameter("timestamp_mode").as_string();
+    }
     cfg.udp_profile_lidar =
         get_parameter(prefix + "udp_profile_lidar").as_string();
     cfg.azimuth_window_start =
@@ -620,6 +676,7 @@ bool OusterDriver::start_sensor_context(
 
         auto& pf = sensor::get_format(ctx->info);
         ctx->lidar_packet.buf.resize(pf.lidar_packet_size);
+        ctx->packet_format = &pf;
 
         auto point_type = get_parameter("point_type").as_string();
         auto organized = get_parameter("organized").as_bool();
@@ -640,15 +697,14 @@ bool OusterDriver::start_sensor_context(
             min_scan_valid_columns_ratio > 1.0)
             throw std::runtime_error(
                 "min_scan_valid_columns_ratio out of bounds");
+        ctx->min_scan_valid_columns_ratio = min_scan_valid_columns_ratio;
 
         auto ctx_ptr = ctx.get();
-        std::vector<LidarScanProcessor> processors;
-        processors.push_back(
+        ctx->lidar_scan_processor =
             PointCloudProcessorFactory::create_point_cloud_processor(
-                point_type, ctx->info, ctx->profile.point_cloud_frame,
-                false, organized, destagger, min_range, max_range,
-                v_reduction, mask_path,
-                [ctx_ptr](PointCloudProcessor_OutputType msgs) {
+                point_type, ctx->info, ctx->profile.point_cloud_frame, false,
+                organized, destagger, min_range, max_range, v_reduction,
+                mask_path, [ctx_ptr](PointCloudProcessor_OutputType msgs) {
                     std::lock_guard<std::mutex> lock(ctx_ptr->clouds_mutex);
                     ctx_ptr->processed_clouds.resize(msgs.size());
                     for (size_t i = 0; i < msgs.size(); ++i) {
@@ -656,9 +712,8 @@ bool OusterDriver::start_sensor_context(
                     }
                     if (!msgs.empty()) {
                         ctx_ptr->last_cloud_stamp = msgs[0]->header.stamp;
-                        ctx_ptr->cloud_ready = true;
                     }
-                }));
+                });
 
         if (PointCloudProcessorFactory::point_type_requires_intensity(point_type) &&
             !PointCloudProcessorFactory::profile_has_intensity(
@@ -671,10 +726,17 @@ bool OusterDriver::start_sensor_context(
                               << to_string(ctx->info.format.udp_profile_lidar));
         }
 
-        ctx->lidar_packet_handler = LidarPacketHandler::create(
-            ctx->info, processors, ctx->profile.timestamp_mode,
-            static_cast<int64_t>(ctx->profile.ptp_utc_tai_offset * 1e9),
-            static_cast<float>(min_scan_valid_columns_ratio));
+        ctx->scan_batcher = std::make_unique<ouster::ScanBatcher>(ctx->info);
+        ctx->active_scan = std::make_unique<ouster::LidarScan>(
+            ctx->info.format.columns_per_frame, ctx->info.format.pixels_per_column,
+            ctx->info.format.udp_profile_lidar);
+        ctx->scan_col_ts_spacing_ns =
+            compute_scan_col_ts_spacing_ns(ctx->info.mode);
+        ctx->ptp_utc_tai_offset_ns =
+            static_cast<int64_t>(ctx->profile.ptp_utc_tai_offset * 1e9);
+        ctx->expect_frame_start = true;
+        ctx->stamp_ready = false;
+        ctx->scan_dirty.store(false);
 
         ctx->running = true;
         ctx->packet_thread = std::make_unique<std::thread>([this, ctx]() {
@@ -691,7 +753,7 @@ bool OusterDriver::start_sensor_context(
                 if (state & sensor::LIDAR_DATA) {
                     if (sensor::read_lidar_packet(*ctx->client,
                                                   ctx->lidar_packet)) {
-                        ctx->lidar_packet_handler(ctx->lidar_packet);
+                        handle_streaming_packet(ctx, ctx->lidar_packet);
                     }
                 }
             }
@@ -774,14 +836,100 @@ void OusterDriver::stop_sensor_contexts() {
             ctx->packet_thread->join();
         }
         ctx->packet_thread.reset();
+        ctx->scan_batcher.reset();
+        ctx->active_scan.reset();
         ctx->client.reset();
-        ctx->lidar_packet_handler = nullptr;
+        ctx->packet_format = nullptr;
+        ctx->lidar_scan_processor = nullptr;
+        ctx->scan_dirty = false;
+        ctx->stamp_ready = false;
+        ctx->expect_frame_start = true;
         {
             std::lock_guard<std::mutex> lock(ctx->clouds_mutex);
             ctx->processed_clouds.clear();
-            ctx->cloud_ready = false;
         }
     }
+}
+
+void OusterDriver::update_scan_timestamps_locked(
+    const std::shared_ptr<SensorContext>& ctx,
+    const rclcpp::Time& packet_receive_time, int packet_first_col) {
+    if (!ctx->active_scan) return;
+
+    if (ctx->expect_frame_start && is_ros_time_mode(ctx->profile.timestamp_mode)) {
+        const auto offset_ns = static_cast<int64_t>(std::llround(
+            ctx->scan_col_ts_spacing_ns * static_cast<double>(packet_first_col)));
+        ctx->active_scan_stamp = packet_receive_time - rclcpp::Duration(0, offset_ns);
+        ctx->stamp_ready = true;
+    }
+
+    auto scan_ts = first_nonzero_timestamp(ctx->active_scan->timestamp());
+    if (scan_ts == 0) {
+        scan_ts = static_cast<uint64_t>(packet_receive_time.nanoseconds());
+        RCLCPP_DEBUG_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "Profile '%s' using packet receive time for scan timestamp",
+            ctx->profile.name.c_str());
+    }
+
+    if (ctx->profile.timestamp_mode == "TIME_FROM_PTP_1588") {
+        scan_ts = impl::ts_safe_offset_add(scan_ts, ctx->ptp_utc_tai_offset_ns);
+    }
+    ctx->active_scan_ts = scan_ts;
+
+    if (!is_ros_time_mode(ctx->profile.timestamp_mode) || !ctx->stamp_ready) {
+        ctx->active_scan_stamp = rclcpp::Time(scan_ts, node_clock_type());
+        ctx->stamp_ready = true;
+    }
+    ctx->expect_frame_start = false;
+}
+
+void OusterDriver::handle_streaming_packet(
+    const std::shared_ptr<SensorContext>& ctx,
+    const sensor::LidarPacket& packet) {
+    if (!ctx->scan_batcher || !ctx->active_scan || !ctx->packet_format) return;
+
+    const auto packet_receive_time =
+        rclcpp::Time(packet.host_timestamp, node_clock_type());
+    const int packet_first_col =
+        packet_col_index(*ctx->packet_format, packet.buf.data());
+
+    std::lock_guard<std::mutex> lock(ctx->scan_mutex);
+    bool scan_complete = (*ctx->scan_batcher)(packet, *ctx->active_scan);
+    update_scan_timestamps_locked(ctx, packet_receive_time, packet_first_col);
+    ctx->scan_dirty.store(true, std::memory_order_release);
+    if (scan_complete) {
+        ctx->expect_frame_start = true;
+    }
+}
+
+bool OusterDriver::snapshot_active_scan(
+    const std::shared_ptr<SensorContext>& ctx, ouster::LidarScan& scan_copy,
+    uint64_t& scan_ts, rclcpp::Time& msg_ts) {
+    if (!ctx->scan_dirty.exchange(false)) return false;
+
+    std::lock_guard<std::mutex> lock(ctx->scan_mutex);
+    if (!ctx->active_scan || !ctx->stamp_ready || ctx->active_scan_ts == 0)
+        return false;
+
+    scan_copy = *ctx->active_scan;
+    scan_ts = ctx->active_scan_ts;
+    msg_ts = ctx->active_scan_stamp;
+
+    if (ctx->min_scan_valid_columns_ratio > 0.0) {
+        auto status = scan_copy.status();
+        const size_t valid_cols =
+            std::count_if(status.data(), status.data() + status.size(),
+                          [](const uint32_t s) { return (s & 0x01); });
+        const auto min_required =
+            static_cast<size_t>(ctx->min_scan_valid_columns_ratio *
+                                static_cast<double>(status.size()));
+        if (valid_cols < min_required) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool OusterDriver::transform_cloud(const sensor_msgs::msg::PointCloud2& in,
@@ -830,13 +978,29 @@ bool OusterDriver::collect_transformed_clouds(
     const std::shared_ptr<SensorContext>& ctx,
     std::vector<sensor_msgs::msg::PointCloud2>& transformed,
     rclcpp::Time& msg_ts) {
+    if (!ctx->lidar_scan_processor) return false;
+
+    ouster::LidarScan scan_snapshot{
+        ctx->info.format.columns_per_frame, ctx->info.format.pixels_per_column,
+        ctx->info.format.udp_profile_lidar};
+    uint64_t scan_ts = 0;
+    if (!snapshot_active_scan(ctx, scan_snapshot, scan_ts, msg_ts)) {
+        RCLCPP_DEBUG_THROTTLE(
+            get_logger(), *get_clock(), 2000,
+            "Profile '%s' no snapshot yet (dirty=%d, stamp_ready=%d, ts=%lu)",
+            ctx->profile.name.c_str(),
+            ctx->scan_dirty.load(std::memory_order_relaxed) ? 1 : 0,
+            ctx->stamp_ready ? 1 : 0, static_cast<unsigned long>(scan_ts));
+        return false;
+    }
+
+    ctx->lidar_scan_processor(scan_snapshot, scan_ts, msg_ts);
+
     std::vector<sensor_msgs::msg::PointCloud2> local_clouds;
     {
         std::lock_guard<std::mutex> lock(ctx->clouds_mutex);
-        if (!ctx->cloud_ready) return false;
+        if (ctx->processed_clouds.empty()) return false;
         local_clouds = ctx->processed_clouds;
-        msg_ts = ctx->last_cloud_stamp;
-        ctx->cloud_ready = false;
     }
 
     transformed.clear();
@@ -874,7 +1038,7 @@ void OusterDriver::fusion_timer_callback() {
         rclcpp::Time msg_ts;
         if (!collect_transformed_clouds(ctx, transformed, msg_ts)) {
             RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 2000,
-                                  "Profile '%s' has no processed cloud yet",
+                                  "Profile '%s' has no new cloud data yet",
                                   ctx->profile.name.c_str());
             continue;
         }
