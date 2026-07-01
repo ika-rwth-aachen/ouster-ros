@@ -24,6 +24,7 @@ find_package(pcl_conversions REQUIRED)
 find_package(tf2_eigen REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(point_cloud_transport REQUIRED)
 # Use OpenCV libs variable (OpenCV::OpenCV target may not resolve on all systems)
 if(NOT OpenCV_LIBS)
   set(OpenCV_LIBS ${OpenCV_LIBRARIES})
@@ -121,6 +122,7 @@ function(create_ros2_component
     std_msgs
     sensor_msgs
     geometry_msgs
+    point_cloud_transport
     ${additional_dependencies}
   )
 

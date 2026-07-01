@@ -24,6 +24,8 @@
 #include "point_cloud_processor_factory.h"
 #include "telemetry_handler.h"
 
+#include <point_cloud_transport/point_cloud_transport.hpp>
+
 namespace ouster_ros {
 
 namespace ChanField = ouster::sdk::core::ChanField;
@@ -98,9 +100,17 @@ class OusterDriver : public OusterSensor {
         std::vector<LidarScanProcessor> processors;
         if (impl::check_token(tokens, "PCL")) {
             lidar_pubs.resize(num_returns);
+
+            // extra node until point_cloud_transport supports LifecycleNode
+            // https://github.com/ros-perception/point_cloud_transport/pull/109
+            auto pct_node = std::make_shared<rclcpp::Node>("os_driver_point_cloud_transport");
+            point_cloud_transport::PointCloudTransport pct(pct_node);
+
             for (int i = 0; i < num_returns; ++i) {
-                lidar_pubs[i] = create_publisher<sensor_msgs::msg::PointCloud2>(
-                    topic_for_return("points", i), selected_qos);
+                std::string topic = topic_for_return("points", i);
+                // Convert rclcpp::QoS to rmw_qos_profile_t
+                lidar_pubs[i] = std::make_shared<point_cloud_transport::Publisher>(
+                    pct.advertise(topic, selected_qos.get_rmw_qos_profile()));
             }
 
             auto point_type = get_parameter("point_type").as_string();
@@ -278,7 +288,7 @@ class OusterDriver : public OusterSensor {
     OusterStaticTransformsBroadcaster<rclcpp_lifecycle::LifecycleNode> tf_bcast;
 
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub;
-    std::vector<rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr>
+    std::vector<std::shared_ptr<point_cloud_transport::Publisher>>
         lidar_pubs;
     std::vector<rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr>
         scan_pubs;
